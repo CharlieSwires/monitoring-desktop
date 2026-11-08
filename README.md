@@ -4,6 +4,8 @@ This Java 17 Swing application is intended to run on a separate, usually-on lapt
 
 It monitors public uptime and response time, TLS-certificate lifetime, each observed backend JVM, MongoDB reachability, JVM heap, CPU, thread count and the backend container filesystem. It does not replace Krystal load-balancer health, Atlas monitoring, host-level monitoring or tested backups.
 
+Snapshots older than two polling intervals are displayed immediately as **STALE/UNCONFIRMED** with an amber row and banner. The last values remain visible for diagnosis, but are no longer presented as current. SMS escalation still waits for the configured consecutive-failure threshold to reduce false alarms while the load balancer is changing targets.
+
 ## Build and run on Windows
 
 Install a JDK 17 and Maven, then from this directory:

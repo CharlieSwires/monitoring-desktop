@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.net.URI;
@@ -41,6 +42,7 @@ import javax.swing.JTextArea;
 import javax.swing.SwingUtilities;
 import javax.swing.WindowConstants;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
 
 public final class MonitorApp {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss")
@@ -123,6 +125,22 @@ public final class MonitorApp {
         JTable table = new JTable(tableModel);
         table.setFillsViewportHeight(true);
         table.setRowHeight(24);
+        table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+            private final Color staleBackground = new Color(255, 235, 170);
+
+            @Override
+            public Component getTableCellRendererComponent(JTable table, Object value,
+                    boolean selected, boolean focused, int row, int column) {
+                Component component = super.getTableCellRendererComponent(
+                        table, value, selected, focused, row, column);
+                if (!selected) {
+                    String status = String.valueOf(table.getModel().getValueAt(row, 1));
+                    component.setBackground("STALE".equals(status) || "UNCONFIRMED".equals(status)
+                            ? staleBackground : Color.WHITE);
+                }
+                return component;
+            }
+        });
 
         history = new JTextArea();
         history.setEditable(false);
@@ -236,6 +254,7 @@ public final class MonitorApp {
 
     private void refreshTable(PublicResult external, Map<String, MonitoringSnapshot> current) {
         tableModel.setRowCount(0);
+        Instant displayStaleBefore = Instant.now().minus(config.pollInterval().multipliedBy(2));
         addRow("Public HTTPS /health", external.up() ? "UP" : "DOWN",
                 external.statusCode() == 0 ? external.error() : "HTTP " + external.statusCode(),
                 config.failuresBeforeAlert() + " failed checks", Instant.now());
@@ -247,24 +266,45 @@ public final class MonitorApp {
                 external.certificateDays() < 0 ? "not available" : external.certificateDays() + " days remaining",
                 "< " + config.certificateWarningDays() + " days", Instant.now());
         for (MonitoringSnapshot node : current.values()) {
-            addRow(node.instanceId() + " application", "UP", "uptime " + duration(node.uptimeSeconds()), "n/a", node.timestamp());
-            addRow(node.instanceId() + " MongoDB", node.mongoReachable() ? "UP" : "DOWN",
+            boolean stale = node.timestamp().isBefore(displayStaleBefore);
+            String observedStatus = stale ? "UNCONFIRMED" : "INFO";
+            addRow(node.instanceId() + " application", stale ? "STALE" : "UP",
+                    stale ? "Last successful snapshot is old" : "uptime " + duration(node.uptimeSeconds()),
+                    "fresh within " + config.pollInterval().multipliedBy(2).toSeconds() + "s", node.timestamp());
+            addRow(node.instanceId() + " MongoDB", stale ? "UNCONFIRMED" : node.mongoReachable() ? "UP" : "DOWN",
                     node.mongoPingMillis() + " ms", "must be UP", node.timestamp());
-            addRow(node.instanceId() + " JVM heap", node.heapUsedPercent() < config.heapWarningPercent() ? "OK" : "WARN",
+            addRow(node.instanceId() + " JVM heap", stale ? "UNCONFIRMED"
+                            : node.heapUsedPercent() < config.heapWarningPercent() ? "OK" : "WARN",
                     fmt(node.heapUsedPercent()) + "% (" + mib(node.heapUsedBytes()) + " / " + mib(node.heapMaxBytes()) + " MiB)",
                     ">= " + fmt(config.heapWarningPercent()) + "%", node.timestamp());
-            addRow(node.instanceId() + " process CPU", "INFO", fmt(node.processCpuPercent()) + "%", "trend", node.timestamp());
-            addRow(node.instanceId() + " system CPU", "INFO", fmt(node.systemCpuPercent()) + "%", "trend", node.timestamp());
-            addRow(node.instanceId() + " filesystem", node.filesystemUsedPercent() < config.diskWarningPercent() ? "OK" : "WARN",
+            addRow(node.instanceId() + " process CPU", observedStatus, fmt(node.processCpuPercent()) + "%", "trend", node.timestamp());
+            addRow(node.instanceId() + " system CPU", observedStatus, fmt(node.systemCpuPercent()) + "%", "trend", node.timestamp());
+            addRow(node.instanceId() + " filesystem", stale ? "UNCONFIRMED"
+                            : node.filesystemUsedPercent() < config.diskWarningPercent() ? "OK" : "WARN",
                     fmt(node.filesystemUsedPercent()) + "% used", ">= " + fmt(config.diskWarningPercent()) + "%", node.timestamp());
-            addRow(node.instanceId() + " threads", "INFO", Integer.toString(node.liveThreads()), "trend", node.timestamp());
+            addRow(node.instanceId() + " threads", observedStatus, Integer.toString(node.liveThreads()), "trend", node.timestamp());
         }
+        for (String expected : config.expectedInstanceIds()) {
+            if (!current.containsKey(expected)) {
+                addRow(expected + " application", "UNCONFIRMED", "No snapshot received",
+                        config.failuresBeforeAlert() + " failed checks before CRITICAL", Instant.now());
+            }
+        }
+        long unconfirmedNodes = config.expectedInstanceIds().stream()
+                .filter(expected -> {
+                    MonitoringSnapshot node = current.get(expected);
+                    return node == null || node.timestamp().isBefore(displayStaleBefore);
+                }).count();
         boolean critical = activeAlerts.keySet().stream().anyMatch(k -> k.contains("public-down")
                 || k.endsWith("-mongo") || k.endsWith("-missing"));
-        overall.setText((activeAlerts.isEmpty() ? "ALL CHECKS NORMAL" : activeAlerts.size() + " ACTIVE ALERT(S)")
+        String overallState = !activeAlerts.isEmpty() ? activeAlerts.size() + " ACTIVE ALERT(S)"
+                : unconfirmedNodes > 0 ? unconfirmedNodes + " UNCONFIRMED NODE(S)"
+                : "ALL CHECKS NORMAL";
+        overall.setText(overallState
                 + " — last cycle " + TIME.format(Instant.now()));
-        overall.setBackground(activeAlerts.isEmpty() ? new Color(197, 239, 203)
-                : critical ? new Color(255, 190, 190) : new Color(255, 230, 160));
+        overall.setBackground(critical ? new Color(255, 190, 190)
+                : !activeAlerts.isEmpty() || unconfirmedNodes > 0 ? new Color(255, 230, 160)
+                : new Color(197, 239, 203));
     }
 
     private void transition(String key, boolean active, String alarm, String recovery) {
